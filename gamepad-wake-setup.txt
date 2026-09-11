@@ -1,0 +1,70 @@
+GAMEPAD SCREEN WAKE — Setup & Enable Guide
+==========================================
+
+Files in this directory
+-----------------------
+  gamepad-wake              — The Python daemon script
+  gamepad-wake.service      — systemd user service unit
+  90-controller-wake.rules  — udev rule for hidraw device access
+  (this file)
+
+What it does
+------------
+GNOME ignores gamepad input for idle tracking, so the screen blanks
+even while you're gaming. This daemon monitors 8BitDo controller input
+(via evdev + hidraw) and:
+  1. Unblanks the screen if the screensaver is active
+  2. Injects a tiny synthetic pointer move to reset GNOME's idle timer
+
+It's already installed and running for the "gamer" user. If you want
+to enable it for another user, follow the steps below.
+
+
+Prerequisites (already done system-wide)
+-----------------------------------------
+  - Script installed at:    /usr/local/bin/gamepad-wake
+  - udev rule installed at: /etc/udev/rules.d/90-controller-wake.rules
+  - Your user must be in the "input" group
+
+  To check/add a user to the input group:
+    sudo usermod -aG input <username>
+    (log out and back in for it to take effect)
+
+  Python deps needed (install as root if missing):
+    pip install evdev dbus-python
+
+
+Enable for a user
+-----------------
+Run these as the target user (or prefix with `sudo -u <username>`):
+
+  1. Copy the service file into place:
+       mkdir -p ~/.config/systemd/user/
+       cp /home/sean/gamepad-wake.service ~/.config/systemd/user/
+
+  2. Reload systemd and enable + start the service:
+       systemctl --user daemon-reload
+       systemctl --user enable --now gamepad-wake
+
+  3. Verify it's running:
+       systemctl --user status gamepad-wake
+
+  4. Watch live logs:
+       journalctl --user -u gamepad-wake -f
+
+
+Disable / Stop
+--------------
+  systemctl --user disable --now gamepad-wake
+
+
+Notes
+-----
+  - The service is a USER service (not system-wide), so it must be
+    started per-user, not via sudo systemctl.
+  - It requires an active graphical session (GNOME/Wayland or X11).
+  - Currently hardcoded for 8BitDo controllers (vendor ID 0x2dc8).
+    To support other controllers, edit the vendor filter in the script.
+  - The udev rule (90-controller-wake.rules) grants read access to
+    hidraw devices for the "input" group. Without it the daemon will
+    fall back to evdev only.

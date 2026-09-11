@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+"""
+gamepad-wake: Bridge game controller input to GNOME idle wake.
+
+GNOME/Mutter ignores gamepad input for idle tracking. This daemon monitors
+controller input devices (evdev + hidraw) and:
+  1. Deactivates GNOME screensaver via dbus (unblanks the screen)
+  2. Injects synthetic pointer events via uinput (resets idle timer)
+"""
+
+import glob
+import os
+import re
+import select
+import signal
+import time
+
+import dbus
+from evdev import UInput, ecodes
+
+VENDOR_8BITDO = 0x2dc8
+DEBOUNCE_SECONDS = 1.0
+RESCAN_SECONDS = 5.0
+
+running = True
+
+
+def handle_signal(signum, frame):
+    global running
+    running = False
+
+
+def find_controller_evdev():
+    """Find evdev devices for 8BitDo controllers (xpad driver)."""
+    devices = []
+    try:
+        with open("/proc/bus/input/devices") as f:
+            blocks = f.read().split("\n\n")
+        for block in blocks:
+            if "2dc8" not in block.lower() and "8bitdo" not in block.lower():
+                continue
+            # Look for joystick/gamepad handlers (js*)
+            handler_match = re.search(r"H: Handlers=(.+)", block)
+            if not handler_match:
+                continue
+            handlers = handler_match.group(1)
+            # Find the event device
+            event_match = re.search(r"(event\d+)", handlers)
+            if event_match:
+                dev_path = f"/dev/input/{event_match.group(1)}"
+                if os.access(dev_path, os.R_OK):
+                    devices.append(dev_path)
+    except OSError:
+        pass
+    return devices
+
+
+def find_hidraw_devices():
+    """Find hidraw devices matching 8BitDo by vendor ID."""
+    devices = []
+    for hidraw in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            uevent_path = os.path.join(hidraw, "device", "uevent")
+            with open(uevent_path) as f:
+                uevent = f.read().upper()
+            if f"{VENDOR_8BITDO:04X}" in uevent:
+                dev_name = os.path.basename(hidraw)
+                dev_path = f"/dev/{dev_name}"
+                if os.access(dev_path, os.R_OK):
+                    devices.append(dev_path)
+        except OSError:
+            continue
+    return devices
+
+
+def get_screensaver_proxy():
+    """Get a dbus proxy for the GNOME screensaver."""
+    try:
+        bus = dbus.SessionBus()
+        return bus.get_object("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver")
+    except dbus.DBusException:
+        return None
+
+
+def unblank_screen(proxy):
+    """Deactivate the GNOME screensaver if active."""
+    if proxy is None:
+        return
+    try:
+        iface = dbus.Interface(proxy, "org.gnome.ScreenSaver")
+        if iface.GetActive():
+            iface.SetActive(False)
+            print("gamepad-wake: screen unblanked", flush=True)
+    except dbus.DBusException:
+        pass
+
+
+def main():
+    global running
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    ui = UInput(
+        {
+            ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y],
+            ecodes.EV_KEY: [ecodes.BTN_LEFT]
+        },
+        name="gamepad-wake-bridge",
+        vendor=0xBD00,
+        product=0x0001,
+    )
+    print("gamepad-wake: virtual pointer created", flush=True)
+
+    screensaver = get_screensaver_proxy()
+    print(f"gamepad-wake: screensaver dbus {'connected' if screensaver else 'unavailable'}", flush=True)
+
+    last_poke = 0.0
+    poke_count = 0
+
+    while running:
+        # Find ALL controller input sources: evdev + hidraw
+        evdev_devs = find_controller_evdev()
+        hidraw_devs = find_hidraw_devices()
+        all_devs = evdev_devs + hidraw_devs
+
+        if not all_devs:
+            print("gamepad-wake: no controller devices found, rescanning...", flush=True)
+            time.sleep(RESCAN_SECONDS)
+            continue
+
+        fds = {}
+        for path in all_devs:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                fds[fd] = path
+                src = "evdev" if path.startswith("/dev/input/") else "hidraw"
+                print(f"gamepad-wake: monitoring {path} ({src})", flush=True)
+            except OSError as e:
+                print(f"gamepad-wake: cannot open {path}: {e}", flush=True)
+
+        if not fds:
+            time.sleep(RESCAN_SECONDS)
+            continue
+
+        try:
+            while running and fds:
+                try:
+                    readable, _, _ = select.select(
+                        list(fds.keys()), [], [], RESCAN_SECONDS
+                    )
+                except (ValueError, OSError):
+                    break
+
+                now = time.monotonic()
+                stale = []
+                got_input = False
+
+                for fd in readable:
+                    try:
+                        while True:
+                            try:
+                                data = os.read(fd, 4096)
+                                if not data:
+                                    stale.append(fd)
+                                    break
+                                got_input = True
+                            except BlockingIOError:
+                                break
+                    except OSError:
+                        stale.append(fd)
+                        continue
+
+                if got_input and (now - last_poke) >= DEBOUNCE_SECONDS:
+                    try:
+                        unblank_screen(screensaver)
+
+                        ui.write(ecodes.EV_REL, ecodes.REL_X, 1)
+                        ui.syn()
+                        ui.write(ecodes.EV_REL, ecodes.REL_X, -1)
+                        ui.syn()
+
+                        last_poke = now
+                        poke_count += 1
+                        if poke_count <= 10 or poke_count % 100 == 0:
+                            print(f"gamepad-wake: poke #{poke_count}", flush=True)
+                    except dbus.DBusException:
+                        screensaver = get_screensaver_proxy()
+                    except OSError as e:
+                        print(f"gamepad-wake: uinput error: {e}", flush=True)
+                        running = False
+                        break
+
+                for fd in stale:
+                    path = fds.pop(fd, "?")
+                    print(f"gamepad-wake: lost {path}", flush=True)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+        finally:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if running:
+            time.sleep(RESCAN_SECONDS)
+
+    ui.close()
+    print("gamepad-wake: stopped", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+[Unit]
+Description=Gamepad Wake Bridge (8BitDo hidraw → uinput for GNOME idle)
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/gamepad-wake
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
