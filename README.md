@@ -20,7 +20,7 @@ It's already installed and running for the "gamer" user. If you want
 to enable it for another user, follow the steps below.
 
 
-Prerequisites (already done system-wide)
+Prerequisites
 -----------------------------------------
   - Script installed at:    /usr/local/bin/gamepad-wake
   - udev rule installed at: /etc/udev/rules.d/90-controller-wake.rules
